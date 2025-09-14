@@ -4,7 +4,7 @@ install:
 	go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.27.1
 	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.2.0
 
-gen: check-env
+gen:
 	protoc --version # 3.19.3
 	protoc-gen-go --version # v1.27.1
 	protoc-gen-go-grpc --version # 1.2.0
