@@ -273,8 +273,6 @@ func TestLogging(t *testing.T) {
 
 	wg.Wait()
 
-	fmt.Println(logData1)
-
 	expectedLogData1 := []*Event{
 		{Consumer: "logger2", Method: "/main.Admin/Logging"},
 		{Consumer: "biz_user", Method: "/main.Biz/Check"},

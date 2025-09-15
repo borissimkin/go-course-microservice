@@ -9,21 +9,13 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
-
-/**
-todo:
-0. Сделать обертку над Business +
-1. Ограничение прав доступа к вызываем функциями через ACL
-(через мидлвару с проверкой метаданных к ACL) +
-2. Метод логирования +
-3. Метод статистики
-*/
 
 type Acl map[string][]string
 
@@ -56,6 +48,106 @@ func getConsumer(ctx context.Context) (string, error) {
 	}
 
 	return consumer[0], nil
+}
+
+type StatisticConnection struct {
+	Stat *Stat
+}
+
+func NewStatConenction() *StatisticConnection {
+	return &StatisticConnection{
+		Stat: &Stat{
+			ByMethod:   make(map[string]uint64),
+			ByConsumer: make(map[string]uint64),
+		},
+	}
+}
+
+func (s *StatisticConnection) Clear() {
+	s.Stat = &Stat{
+		ByMethod:   make(map[string]uint64),
+		ByConsumer: make(map[string]uint64),
+	}
+}
+
+type StatisticStreamer struct {
+	mu          sync.Mutex
+	connections map[string]*StatisticConnection
+}
+
+func NewStatStreamer() *StatisticStreamer {
+	return &StatisticStreamer{
+		connections: make(map[string]*StatisticConnection),
+	}
+}
+
+func (s *StatisticStreamer) HasConnections() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	conns := len(s.connections)
+	return conns > 0
+}
+
+func (s *StatisticStreamer) GetConnection(consumer string) *StatisticConnection {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.connections[consumer]
+}
+
+func (s *StatisticStreamer) Save(method string, consumer string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// todo: проверить что не обязательно на has проверять
+	for _, con := range s.connections {
+		byConsumer, has := con.Stat.ByConsumer[consumer]
+		if has {
+			con.Stat.ByConsumer[consumer] = byConsumer + 1
+		} else {
+			con.Stat.ByConsumer[consumer] = 1
+		}
+
+		byMethod, has := con.Stat.ByMethod[method]
+		if has {
+			con.Stat.ByMethod[method] = byMethod + 1
+		} else {
+			con.Stat.ByMethod[method] = 1
+		}
+	}
+}
+
+func (s *StatisticStreamer) Clear(consumer string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	con, has := s.connections[consumer]
+	if !has {
+		return
+	}
+
+	con.Clear()
+}
+
+func (s *StatisticStreamer) AddConnection(consumer string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, has := s.connections[consumer]
+	if has {
+		fmt.Printf("consumer=%s already has connection to statistic", consumer)
+		return
+	}
+
+	con := NewStatConenction()
+	s.connections[consumer] = con
+}
+
+func (s *StatisticStreamer) RemoveConnection(consumer string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.connections, consumer)
 }
 
 // todo: rename to LogStreamer?
@@ -96,13 +188,13 @@ func (l *Logger) AddConnection(consumer string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	ch := make(chan *Event)
-
 	_, has := l.connections[consumer]
 	if has {
-		fmt.Printf("consumer=%s already has conenction to logger", consumer)
+		fmt.Printf("consumer=%s already has connection to logger", consumer)
 		return
 	}
+
+	ch := make(chan *Event)
 
 	l.connections[consumer] = ch
 }
@@ -121,15 +213,17 @@ func (l *Logger) RemoveConnection(consumer string) {
 }
 
 type AdminService struct {
-	Logger *Logger
-	Host   string
+	Logger       *Logger
+	StatStreamer *StatisticStreamer
+	Host         string
 	UnimplementedAdminServer
 }
 
 func NewAdminService(host string) AdminService {
 	return AdminService{
-		Logger: NewLogger(),
-		Host:   host,
+		Logger:       NewLogger(),
+		StatStreamer: NewStatStreamer(),
+		Host:         host,
 	}
 }
 
@@ -162,6 +256,47 @@ func (s AdminService) Logging(params *Nothing, srv Admin_LoggingServer) error {
 }
 
 func (s AdminService) Statistics(params *StatInterval, srv Admin_StatisticsServer) error {
+	ctx := srv.Context()
+
+	consumer, err := getConsumer(ctx)
+	if err != nil {
+		return err
+	}
+
+	s.StatStreamer.AddConnection(consumer)
+
+	ch := make(chan *Stat)
+
+	go func(ch chan *Stat) {
+		timer := time.NewTicker(time.Duration(params.IntervalSeconds) * time.Second)
+
+		defer func() {
+			timer.Stop()
+			s.StatStreamer.RemoveConnection(consumer)
+			close(ch)
+		}()
+
+		for {
+			select {
+			case <-timer.C:
+				stat := s.StatStreamer.GetConnection(consumer)
+				ch <- stat.Stat
+				s.StatStreamer.Clear(consumer)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}(ch)
+
+	for stat := range ch {
+		err := srv.Send(stat)
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -270,13 +405,50 @@ func logInterceptor(s AdminService) func(
 	}
 }
 
-func logInterceptorStream(s AdminService) func(interface{}, grpc.ServerStream, *grpc.StreamServerInfo, grpc.StreamHandler) error {
+func statInterceptor(s AdminService) func(
+	context.Context,
+	interface{},
+	*grpc.UnaryServerInfo,
+	grpc.UnaryHandler,
+) (interface{}, error) {
+	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+		if !s.StatStreamer.HasConnections() {
+			return handler(ctx, req)
+		}
+
+		method := info.FullMethod
+		consumer, _ := getConsumer(ctx)
+
+		s.StatStreamer.Save(method, consumer)
+
+		return handler(ctx, req)
+	}
+}
+
+func statInterceptorStream(s AdminService) func(interface{}, grpc.ServerStream, *grpc.StreamServerInfo, grpc.StreamHandler) error {
 	return func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		if !s.StatStreamer.HasConnections() {
+			return handler(srv, ss)
+		}
+
 		ctx := ss.Context()
 
+		method := info.FullMethod
+		consumer, _ := getConsumer(ctx)
+
+		s.StatStreamer.Save(method, consumer)
+
+		return handler(srv, ss)
+	}
+}
+
+func logInterceptorStream(s AdminService) func(interface{}, grpc.ServerStream, *grpc.StreamServerInfo, grpc.StreamHandler) error {
+	return func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 		if !s.Logger.HasConnections() {
 			return handler(srv, ss)
 		}
+
+		ctx := ss.Context()
 
 		method := info.FullMethod
 		consumer, _ := getConsumer(ctx)
@@ -304,8 +476,8 @@ func StartMyMicroservice(ctx context.Context, addr string, aclData string) error
 	bizService := NewBizService()
 
 	server := grpc.NewServer(
-		grpc.ChainUnaryInterceptor(authInterceptor(acl), logInterceptor(admService)),
-		grpc.ChainStreamInterceptor(authInterceptorStream(acl), logInterceptorStream(admService)),
+		grpc.ChainUnaryInterceptor(authInterceptor(acl), logInterceptor(admService), statInterceptor(admService)),
+		grpc.ChainStreamInterceptor(authInterceptorStream(acl), logInterceptorStream(admService), statInterceptorStream(admService)),
 	)
 
 	RegisterAdminServer(server, admService)
