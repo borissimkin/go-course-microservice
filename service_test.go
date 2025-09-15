@@ -224,7 +224,7 @@ func TestLogging(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		for i := 0; i < 3; i++ {
+		for i := 0; i < 4; i++ {
 			evt, err := logStream1.Recv()
 			// log.Println("logger 1", evt, err)
 			if err != nil {
@@ -276,7 +276,7 @@ func TestLogging(t *testing.T) {
 	fmt.Println(logData1)
 
 	expectedLogData1 := []*Event{
-		// {Consumer: "logger2", Method: "/main.Admin/Logging"},
+		{Consumer: "logger2", Method: "/main.Admin/Logging"},
 		{Consumer: "biz_user", Method: "/main.Biz/Check"},
 		{Consumer: "biz_admin", Method: "/main.Biz/Check"},
 		{Consumer: "biz_admin", Method: "/main.Biz/Test"},

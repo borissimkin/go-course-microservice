@@ -258,10 +258,27 @@ func logInterceptor(s AdminService) func(
 		consumer, _ := getConsumer(ctx)
 
 		event := s.createEvent(consumer, method)
-		i, e := handler(ctx, req)
 		s.Logger.Send(event)
 
-		return i, e
+		return handler(ctx, req)
+	}
+}
+
+func logInterceptorStream(s AdminService) func(interface{}, grpc.ServerStream, *grpc.StreamServerInfo, grpc.StreamHandler) error {
+	return func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		ctx := ss.Context()
+
+		if !s.Logger.HasConnections() {
+			return handler(srv, ss)
+		}
+
+		method := info.FullMethod
+		consumer, _ := getConsumer(ctx)
+
+		event := s.createEvent(consumer, method)
+		s.Logger.Send(event)
+
+		return handler(srv, ss)
 	}
 }
 
@@ -282,7 +299,7 @@ func StartMyMicroservice(ctx context.Context, addr string, aclData string) error
 
 	server := grpc.NewServer(
 		grpc.ChainUnaryInterceptor(authInterceptor(acl), logInterceptor(admService)),
-		grpc.StreamInterceptor(authInterceptorStream(acl)),
+		grpc.ChainStreamInterceptor(authInterceptorStream(acl), logInterceptorStream(admService)),
 	)
 
 	RegisterAdminServer(server, admService)
