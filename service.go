@@ -3,8 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"net"
 	"strings"
+	"sync"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -17,7 +21,7 @@ todo:
 0. Сделать обертку над Business +
 1. Ограничение прав доступа к вызываем функциями через ACL
 (через мидлвару с проверкой метаданных к ACL) +
-2. Метод логирования
+2. Метод логирования +
 3. Метод статистики
 */
 
@@ -43,15 +47,111 @@ func (s BizService) Test(ctx context.Context, n *Nothing) (*Nothing, error) {
 	return n, nil
 }
 
+func getConsumer(ctx context.Context) (string, error) {
+	md, _ := metadata.FromIncomingContext(ctx)
+
+	consumer := md.Get("consumer")
+	if len(consumer) <= 0 {
+		return "", errors.New("ctx doesnt have consumer")
+	}
+
+	return consumer[0], nil
+}
+
+type Logger struct {
+	connections map[string]chan *Event
+	mu          sync.Mutex
+}
+
+func NewLogger() *Logger {
+	return &Logger{
+		connections: make(map[string]chan *Event),
+	}
+}
+
+func (l *Logger) HasConnections() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	conns := len(l.connections)
+	return conns > 0
+}
+
+func (l *Logger) Send(e *Event) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, ch := range l.connections {
+		ch <- e
+	}
+}
+
+func (l *Logger) GetCh(consumer string) <-chan *Event {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return l.connections[consumer]
+}
+
+func (l *Logger) AddConnection(consumer string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	ch := make(chan *Event)
+
+	_, has := l.connections[consumer]
+	if has {
+		fmt.Printf("consumer=%s already has conenction to logger", consumer)
+		return
+	}
+
+	l.connections[consumer] = ch
+}
+
+func (l *Logger) RemoveConnection(consumer string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	conn, ok := l.connections[consumer]
+	if !ok {
+		return
+	}
+
+	close(conn)
+	delete(l.connections, consumer)
+}
+
 type AdminService struct {
+	Logger *Logger
+	Host   string
 	UnimplementedAdminServer
 }
 
-func NewAdminService() AdminService {
-	return AdminService{}
+func NewAdminService(host string) AdminService {
+	return AdminService{
+		Logger: NewLogger(),
+		Host:   host,
+	}
 }
 
 func (s AdminService) Logging(params *Nothing, srv Admin_LoggingServer) error {
+	ctx := srv.Context()
+	consumer, err := getConsumer(ctx)
+	if err != nil {
+		return err
+	}
+
+	s.Logger.AddConnection(consumer)
+	ch := s.Logger.GetCh(consumer)
+
+	for event := range ch {
+		err := srv.Send(event)
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -86,29 +186,20 @@ func checkAllowedMethods(allowedMethods []string, method string) bool {
 }
 
 func checkAuth(ctx context.Context, acl Acl, fullMethod string) error {
-	md, _ := metadata.FromIncomingContext(ctx)
-	err := status.Error(codes.Unauthenticated, "Unauthenticated")
+	authErr := status.Error(codes.Unauthenticated, "Unauthenticated")
 
-	consumer := md.Get("consumer")
-	if len(consumer) <= 0 {
-		return err
+	consumer, err := getConsumer(ctx)
+	if err != nil {
+		return authErr
 	}
 
-	allowed := false
-	for _, c := range consumer {
-		methods, ok := acl[c]
-		if !ok {
-			continue
-		}
-
-		if checkAllowedMethods(methods, fullMethod) {
-			allowed = true
-			break
-		}
+	methods, ok := acl[consumer]
+	if !ok {
+		return authErr
 	}
 
-	if !allowed {
-		return err
+	if !checkAllowedMethods(methods, fullMethod) {
+		return authErr
 	}
 
 	return nil
@@ -142,6 +233,38 @@ func authInterceptorStream(acl Acl) func(interface{}, grpc.ServerStream, *grpc.S
 	}
 }
 
+func (s *AdminService) createEvent(consumer string, method string) *Event {
+	host := s.Host + method
+
+	return &Event{
+		Consumer: consumer,
+		Method:   method,
+		Host:     host,
+	}
+}
+
+func logInterceptor(s AdminService) func(
+	context.Context,
+	interface{},
+	*grpc.UnaryServerInfo,
+	grpc.UnaryHandler,
+) (interface{}, error) {
+	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+		if !s.Logger.HasConnections() {
+			return handler(ctx, req)
+		}
+
+		method := info.FullMethod
+		consumer, _ := getConsumer(ctx)
+
+		event := s.createEvent(consumer, method)
+		i, e := handler(ctx, req)
+		s.Logger.Send(event)
+
+		return i, e
+	}
+}
+
 func StartMyMicroservice(ctx context.Context, addr string, aclData string) error {
 	acl := make(Acl)
 	err := json.Unmarshal([]byte(aclData), &acl)
@@ -154,13 +277,13 @@ func StartMyMicroservice(ctx context.Context, addr string, aclData string) error
 		return err
 	}
 
+	admService := NewAdminService(addr)
+	bizService := NewBizService()
+
 	server := grpc.NewServer(
-		grpc.UnaryInterceptor(authInterceptor(acl)),
+		grpc.ChainUnaryInterceptor(authInterceptor(acl), logInterceptor(admService)),
 		grpc.StreamInterceptor(authInterceptorStream(acl)),
 	)
-
-	admService := NewAdminService()
-	bizService := NewBizService()
 
 	RegisterAdminServer(server, admService)
 	RegisterBizServer(server, bizService)
