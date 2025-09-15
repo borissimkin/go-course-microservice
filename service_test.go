@@ -492,6 +492,7 @@ func TestWorkAfterDisconnect(t *testing.T) {
 			evt, err := logStream1.Recv()
 			// log.Println("logger 1", evt, err)
 			if err != nil {
+				fmt.Println(i)
 				t.Errorf("unexpected error: %v, awaiting event", err)
 				return
 			}

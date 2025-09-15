@@ -58,6 +58,7 @@ func getConsumer(ctx context.Context) (string, error) {
 	return consumer[0], nil
 }
 
+// todo: rename to LogStreamer?
 type Logger struct {
 	connections map[string]chan *Event
 	mu          sync.Mutex
@@ -142,10 +143,14 @@ func (s AdminService) Logging(params *Nothing, srv Admin_LoggingServer) error {
 	s.Logger.AddConnection(consumer)
 	ch := s.Logger.GetCh(consumer)
 
+	go func() {
+		<-ctx.Done()
+		s.Logger.RemoveConnection(consumer)
+	}()
+
 	for event := range ch {
 		err := srv.Send(event)
 		if err == io.EOF {
-			s.Logger.RemoveConnection(consumer)
 			return nil
 		}
 		if err != nil {
