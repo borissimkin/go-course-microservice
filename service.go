@@ -145,6 +145,7 @@ func (s AdminService) Logging(params *Nothing, srv Admin_LoggingServer) error {
 	for event := range ch {
 		err := srv.Send(event)
 		if err == io.EOF {
+			s.Logger.RemoveConnection(consumer)
 			return nil
 		}
 		if err != nil {
