@@ -99,21 +99,12 @@ func (s *StatisticStreamer) Save(method string, consumer string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// todo: проверить что не обязательно на has проверять
 	for _, con := range s.connections {
-		byConsumer, has := con.Stat.ByConsumer[consumer]
-		if has {
-			con.Stat.ByConsumer[consumer] = byConsumer + 1
-		} else {
-			con.Stat.ByConsumer[consumer] = 1
-		}
+		byConsumer := con.Stat.ByConsumer[consumer]
+		con.Stat.ByConsumer[consumer] = byConsumer + 1
 
-		byMethod, has := con.Stat.ByMethod[method]
-		if has {
-			con.Stat.ByMethod[method] = byMethod + 1
-		} else {
-			con.Stat.ByMethod[method] = 1
-		}
+		byMethod := con.Stat.ByMethod[method]
+		con.Stat.ByMethod[method] = byMethod + 1
 	}
 }
 
@@ -151,25 +142,25 @@ func (s *StatisticStreamer) RemoveConnection(consumer string) {
 }
 
 // todo: rename to LogStreamer?
-type Logger struct {
+type LogStreamer struct {
 	connections map[string]chan *Event
 	mu          sync.Mutex
 }
 
-func NewLogger() *Logger {
-	return &Logger{
+func NewLogStreamer() *LogStreamer {
+	return &LogStreamer{
 		connections: make(map[string]chan *Event),
 	}
 }
 
-func (l *Logger) HasConnections() bool {
+func (l *LogStreamer) HasConnections() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	conns := len(l.connections)
 	return conns > 0
 }
 
-func (l *Logger) Send(e *Event) {
+func (l *LogStreamer) Send(e *Event) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for _, ch := range l.connections {
@@ -177,14 +168,14 @@ func (l *Logger) Send(e *Event) {
 	}
 }
 
-func (l *Logger) GetCh(consumer string) <-chan *Event {
+func (l *LogStreamer) GetCh(consumer string) <-chan *Event {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	return l.connections[consumer]
 }
 
-func (l *Logger) AddConnection(consumer string) {
+func (l *LogStreamer) AddConnection(consumer string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -199,7 +190,7 @@ func (l *Logger) AddConnection(consumer string) {
 	l.connections[consumer] = ch
 }
 
-func (l *Logger) RemoveConnection(consumer string) {
+func (l *LogStreamer) RemoveConnection(consumer string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -213,7 +204,7 @@ func (l *Logger) RemoveConnection(consumer string) {
 }
 
 type AdminService struct {
-	Logger       *Logger
+	LogStreamer  *LogStreamer
 	StatStreamer *StatisticStreamer
 	Host         string
 	UnimplementedAdminServer
@@ -221,7 +212,7 @@ type AdminService struct {
 
 func NewAdminService(host string) AdminService {
 	return AdminService{
-		Logger:       NewLogger(),
+		LogStreamer:  NewLogStreamer(),
 		StatStreamer: NewStatStreamer(),
 		Host:         host,
 	}
@@ -234,12 +225,12 @@ func (s AdminService) Logging(params *Nothing, srv Admin_LoggingServer) error {
 		return err
 	}
 
-	s.Logger.AddConnection(consumer)
-	ch := s.Logger.GetCh(consumer)
+	s.LogStreamer.AddConnection(consumer)
+	ch := s.LogStreamer.GetCh(consumer)
 
 	go func() {
 		<-ctx.Done()
-		s.Logger.RemoveConnection(consumer)
+		s.LogStreamer.RemoveConnection(consumer)
 	}()
 
 	for event := range ch {
@@ -391,7 +382,7 @@ func logInterceptor(s AdminService) func(
 	grpc.UnaryHandler,
 ) (interface{}, error) {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-		if !s.Logger.HasConnections() {
+		if !s.LogStreamer.HasConnections() {
 			return handler(ctx, req)
 		}
 
@@ -399,7 +390,7 @@ func logInterceptor(s AdminService) func(
 		consumer, _ := getConsumer(ctx)
 
 		event := s.createEvent(consumer, method)
-		s.Logger.Send(event)
+		s.LogStreamer.Send(event)
 
 		return handler(ctx, req)
 	}
@@ -444,7 +435,7 @@ func statInterceptorStream(s AdminService) func(interface{}, grpc.ServerStream, 
 
 func logInterceptorStream(s AdminService) func(interface{}, grpc.ServerStream, *grpc.StreamServerInfo, grpc.StreamHandler) error {
 	return func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-		if !s.Logger.HasConnections() {
+		if !s.LogStreamer.HasConnections() {
 			return handler(srv, ss)
 		}
 
@@ -454,7 +445,7 @@ func logInterceptorStream(s AdminService) func(interface{}, grpc.ServerStream, *
 		consumer, _ := getConsumer(ctx)
 
 		event := s.createEvent(consumer, method)
-		s.Logger.Send(event)
+		s.LogStreamer.Send(event)
 
 		return handler(srv, ss)
 	}
